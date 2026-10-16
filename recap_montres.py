@@ -3,8 +3,8 @@ Recap Montres Hebdo
 --------------------
 Lit une liste de flux RSS horlogerie, garde les articles des 7 derniers
 jours qui parlent de tes marques, supprime les doublons entre sources,
-envoie le récap sur Telegram (+ quelques photos) et t'alerte en privé
-si quelque chose plante.
+envoie le récap sur Telegram (avec une grande image en haut) et t'alerte
+en privé si quelque chose plante.
 
 Variables d'environnement attendues :
   TELEGRAM_TOKEN   -> le token donné par @BotFather
@@ -24,12 +24,13 @@ import requests
 # ---------------------------------------------------------------------
 # 0. INTERRUPTEURS (True = activé, False = désactivé)
 # ---------------------------------------------------------------------
-ENABLE_DEDUP = True    # supprime les articles en double entre sources
-ENABLE_IMAGES = True  # envoie quelques photos après le récap
-ENABLE_ALERTS = True   # t'écrit en privé si un flux ou le script plante
-TEST_ALERT = False     # True = fait planter le script exprès pour tester l'alerte
+ENABLE_DEDUP = True         # supprime les articles en double entre sources
+ENABLE_TOP_PREVIEW = False   # grande image en haut du message (même message que le texte)
+ENABLE_IMAGES = True       # album de photos séparé, envoyé AVANT le texte
+ENABLE_ALERTS = True        # t'écrit en privé si un flux ou le script plante
+TEST_ALERT = False          # True = fait planter le script exprès pour tester l'alerte
 
-MAX_IMAGES = 3         # nombre maximum de photos envoyées
+MAX_IMAGES = 3              # nombre de photos de l'album (si ENABLE_IMAGES)
 
 # ---------------------------------------------------------------------
 # 1. CONFIGURATION
@@ -75,7 +76,7 @@ BRANDS = [
 DAYS_BACK = 7
 MAX_ARTICLES_PER_FEED = 5
 MAX_MESSAGE_LENGTH = 4000
-SHOW_PREVIEW = False
+SHOW_PREVIEW = False  # utilisé seulement si ENABLE_TOP_PREVIEW = False
 USER_AGENT = "Mozilla/5.0 (compatible; CadranBot/1.0)"
 
 SEPARATOR = "━━━━━━━━━━━━━━"
@@ -112,16 +113,28 @@ def telegram_call(method, payload):
     return result
 
 
-def send_to_telegram(text):
-    telegram_call(
-        "sendMessage",
-        {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": not SHOW_PREVIEW,
-        },
-    )
+def send_to_telegram(text, preview_url=None):
+    """Envoie un message texte. Si preview_url est donné, sa grande image
+    s'affiche AU-DESSUS du texte, dans le même message."""
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+    }
+
+    if preview_url:
+        payload["link_preview_options"] = json.dumps(
+            {
+                "is_disabled": False,
+                "url": preview_url,
+                "prefer_large_media": True,
+                "show_above_text": True,
+            }
+        )
+    else:
+        payload["link_preview_options"] = json.dumps({"is_disabled": not SHOW_PREVIEW})
+
+    telegram_call("sendMessage", payload)
 
 
 def send_alert(text):
@@ -193,7 +206,7 @@ def extract_image(entry):
 
 
 def send_images(articles_by_source):
-    """Envoie jusqu'à MAX_IMAGES photos. Une erreur ici ne bloque jamais le récap."""
+    """Envoie un album de photos (avant le texte). Une erreur ici ne bloque jamais le récap."""
     candidates = [
         art
         for articles in articles_by_source.values()
@@ -238,7 +251,6 @@ def send_images(articles_by_source):
             )
         print(f"{len(selected)} image(s) envoyée(s).")
     except Exception as exc:
-        # Une image refusée fait échouer tout l'album : on réessaie une par une.
         print(f"[WARN] Album refusé ({exc}), envoi image par image.", file=sys.stderr)
         for art in selected:
             try:
@@ -434,6 +446,19 @@ def split_message(text, max_length=MAX_MESSAGE_LENGTH):
 # ---------------------------------------------------------------------
 # 8. POINT D'ENTRÉE
 # ---------------------------------------------------------------------
+def pick_preview_url(articles_by_source):
+    """Choisit le lien dont Telegram affichera la grande image en haut :
+    l'article le plus récent (de préférence un qui a une image)."""
+    all_articles = [
+        a for arts in articles_by_source.values() for a in arts if a["link"]
+    ]
+    if not all_articles:
+        return None
+    with_image = [a for a in all_articles if a.get("image")]
+    pool = with_image or all_articles
+    return max(pool, key=lambda a: a["date"])["link"]
+
+
 def run():
     if TEST_ALERT:
         raise RuntimeError("Test d'alerte : tout va bien, c'est voulu !")
@@ -452,13 +477,20 @@ def run():
     message = format_message(articles)
     print(message)
 
-    chunks = split_message(message)
-    for i, chunk in enumerate(chunks, start=1):
-        send_to_telegram(chunk)
-        print(f"Message {i}/{len(chunks)} envoyé.")
-
+    # Album de photos séparé : envoyé AVANT le texte (donc en haut)
     if ENABLE_IMAGES and articles:
         send_images(articles)
+
+    # Grande image dans le même message que le texte
+    preview_url = None
+    if ENABLE_TOP_PREVIEW and articles:
+        preview_url = pick_preview_url(articles)
+
+    chunks = split_message(message)
+    for i, chunk in enumerate(chunks, start=1):
+        # l'image n'apparaît que sur le premier message si le récap est découpé
+        send_to_telegram(chunk, preview_url if i == 1 else None)
+        print(f"Message {i}/{len(chunks)} envoyé.")
 
 
 def main():
