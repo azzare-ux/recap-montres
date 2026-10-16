@@ -148,7 +148,7 @@ def send_to_telegram(text):
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "Markdown",
-        "disable_web_page_preview": False,
+        "disable_web_page_preview": True,
     }
 
     response = requests.post(url, data=payload, timeout=15)
