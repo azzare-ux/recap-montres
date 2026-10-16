@@ -2,15 +2,19 @@
 Recap Montres Hebdo
 --------------------
 Lit une liste de flux RSS horlogerie, garde les articles des 7 derniers
-jours qui parlent de tes marques, formate un message lisible et l'envoie
-sur Telegram. Si le message est trop long, il est découpé automatiquement.
+jours qui parlent de tes marques, supprime les doublons entre sources,
+envoie le récap sur Telegram (+ quelques photos) et t'alerte en privé
+si quelque chose plante.
 
 Variables d'environnement attendues :
-  TELEGRAM_TOKEN  -> le token donné par @BotFather
+  TELEGRAM_TOKEN   -> le token donné par @BotFather
   TELEGRAM_CHAT_ID -> @tonchannel (public) ou -100xxxxxxxxxx (privé)
+  ALERT_CHAT_ID    -> (optionnel) ton ID personnel, pour recevoir les alertes
 """
 
+import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -18,10 +22,18 @@ import feedparser
 import requests
 
 # ---------------------------------------------------------------------
+# 0. INTERRUPTEURS (True = activé, False = désactivé)
+# ---------------------------------------------------------------------
+ENABLE_DEDUP = True    # supprime les articles en double entre sources
+ENABLE_IMAGES = False  # envoie quelques photos après le récap
+ENABLE_ALERTS = True   # t'écrit en privé si un flux ou le script plante
+TEST_ALERT = False     # True = fait planter le script exprès pour tester l'alerte
+
+MAX_IMAGES = 3         # nombre maximum de photos envoyées
+
+# ---------------------------------------------------------------------
 # 1. CONFIGURATION
 # ---------------------------------------------------------------------
-# Pour ajouter une source : une ligne ("Nom affiché", "adresse du flux").
-# Un flux qui ne marche pas est simplement ignoré (voir les logs [WARN]).
 RSS_FEEDS = [
     ("Monochrome Watches", "https://monochrome-watches.com/feed/"),
     ("Fratello Watches", "https://www.fratellowatches.com/feed/"),
@@ -32,7 +44,6 @@ RSS_FEEDS = [
     ("Time+Tide", "https://timeandtidewatches.com/feed/"),
 ]
 
-# Un emoji par source. Même nom que dans RSS_FEEDS (sinon 📰 par défaut).
 SOURCE_EMOJIS = {
     "Monochrome Watches": "🔬",
     "Fratello Watches": "🏁",
@@ -44,7 +55,6 @@ SOURCE_EMOJIS = {
 }
 DEFAULT_EMOJI = "📰"
 
-# Marques à suivre (liste vide = tous les articles, sans filtre)
 BRANDS = [
     "Rolex",
     "Omega",
@@ -64,34 +74,78 @@ BRANDS = [
 
 DAYS_BACK = 7
 MAX_ARTICLES_PER_FEED = 5
-
-# Telegram refuse les messages de plus de 4096 caractères (petite marge ici).
 MAX_MESSAGE_LENGTH = 4000
-
-# True = grande carte d'aperçu pour le premier lien / False = message compact
 SHOW_PREVIEW = False
-
-# "Carte d'identité" envoyée aux sites (certains bloquent les robots sans).
 USER_AGENT = "Mozilla/5.0 (compatible; CadranBot/1.0)"
 
 SEPARATOR = "━━━━━━━━━━━━━━"
 WEEKDAYS_FR = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."]
 
+# Mots ignorés pour détecter les doublons (trop génériques)
+STOPWORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "first", "look",
+    "meet", "introducing", "introduces", "new", "watch", "watches", "review",
+    "hands", "talks", "about", "into", "your", "what", "best",
+    "les", "des", "une", "pour", "avec", "dans", "sur", "montre", "montres",
+}
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+ALERT_CHAT_ID = os.environ.get("ALERT_CHAT_ID")
 
 
 # ---------------------------------------------------------------------
-# 2. FILTRE PAR MARQUE
+# 2. OUTILS TELEGRAM
+# ---------------------------------------------------------------------
+def telegram_call(method, payload):
+    """Appelle l'API Telegram et lève une erreur claire si ça échoue."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError(
+            "TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID manquant. "
+            "Vérifie tes secrets GitHub."
+        )
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    response = requests.post(url, data=payload, timeout=30)
+    result = response.json()
+    if not result.get("ok"):
+        raise RuntimeError(f"Erreur Telegram ({method}) : {result.get('description', result)}")
+    return result
+
+
+def send_to_telegram(text):
+    telegram_call(
+        "sendMessage",
+        {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": not SHOW_PREVIEW,
+        },
+    )
+
+
+def send_alert(text):
+    """Message privé d'alerte. Ne fait jamais planter le script."""
+    if not ENABLE_ALERTS or not ALERT_CHAT_ID or not TELEGRAM_TOKEN:
+        return
+    try:
+        safe_text = text.replace(TELEGRAM_TOKEN, "***")[:4000]
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": ALERT_CHAT_ID, "text": safe_text},
+            timeout=15,
+        )
+    except Exception as exc:
+        print(f"[WARN] Alerte non envoyée : {str(exc).replace(TELEGRAM_TOKEN, '***')}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------
+# 3. FILTRE PAR MARQUE ET NETTOYAGE
 # ---------------------------------------------------------------------
 def find_brand(title, summary):
-    """
-    Retourne la marque trouvée dans l'article, ou None si aucune.
-    Si BRANDS est vide (pas de filtre), retourne "" (l'article passe).
-    """
+    """Marque trouvée, None si aucune, "" si pas de filtre (BRANDS vide)."""
     if not BRANDS:
         return ""
-
     text = f"{title} {summary}".lower()
     for brand in BRANDS:
         if brand.lower() in text:
@@ -99,11 +153,8 @@ def find_brand(title, summary):
     return None
 
 
-# ---------------------------------------------------------------------
-# 3. NETTOYAGE DES TITRES
-# ---------------------------------------------------------------------
 def clean_title(title):
-    """Enlève les caractères qui peuvent casser le format Markdown de Telegram."""
+    """Enlève les caractères qui peuvent casser le Markdown de Telegram."""
     title = title.replace("[", "(").replace("]", ")")
     for char in ("_", "*", "`"):
         title = title.replace(char, " ")
@@ -111,18 +162,104 @@ def clean_title(title):
 
 
 def format_date(dt):
-    """Ex : ven. 16/10"""
     return f"{WEEKDAYS_FR[dt.weekday()]} {dt.strftime('%d/%m')}"
 
 
 # ---------------------------------------------------------------------
-# 4. RÉCUPÉRATION DES ARTICLES
+# 4. IMAGES
+# ---------------------------------------------------------------------
+def extract_image(entry):
+    """Cherche une image dans l'article RSS. Retourne une URL ou None."""
+    for key in ("media_content", "media_thumbnail"):
+        for media in entry.get(key, []) or []:
+            url = media.get("url", "")
+            if url.startswith("http"):
+                return url
+
+    for enc in entry.get("enclosures", []) or []:
+        if enc.get("type", "").startswith("image") and enc.get("href", "").startswith("http"):
+            return enc["href"]
+
+    html = ""
+    if entry.get("content"):
+        html = entry["content"][0].get("value", "")
+    html = html or entry.get("summary", "")
+
+    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html)
+    if match and match.group(1).startswith("http"):
+        return match.group(1)
+
+    return None
+
+
+def send_images(articles_by_source):
+    """Envoie jusqu'à MAX_IMAGES photos. Une erreur ici ne bloque jamais le récap."""
+    candidates = [
+        art
+        for articles in articles_by_source.values()
+        for art in articles
+        if art.get("image")
+    ]
+    candidates.sort(key=lambda a: a["date"], reverse=True)
+    selected = candidates[:MAX_IMAGES]
+
+    if not selected:
+        print("[INFO] Aucune image trouvée dans les articles.")
+        return
+
+    def caption(art):
+        return f"[{art['title']}]({art['link']})"
+
+    try:
+        if len(selected) == 1:
+            art = selected[0]
+            telegram_call(
+                "sendPhoto",
+                {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "photo": art["image"],
+                    "caption": caption(art),
+                    "parse_mode": "Markdown",
+                },
+            )
+        else:
+            media = [
+                {
+                    "type": "photo",
+                    "media": art["image"],
+                    "caption": caption(art),
+                    "parse_mode": "Markdown",
+                }
+                for art in selected
+            ]
+            telegram_call(
+                "sendMediaGroup",
+                {"chat_id": TELEGRAM_CHAT_ID, "media": json.dumps(media)},
+            )
+        print(f"{len(selected)} image(s) envoyée(s).")
+    except Exception as exc:
+        # Une image refusée fait échouer tout l'album : on réessaie une par une.
+        print(f"[WARN] Album refusé ({exc}), envoi image par image.", file=sys.stderr)
+        for art in selected:
+            try:
+                telegram_call(
+                    "sendPhoto",
+                    {
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "photo": art["image"],
+                        "caption": caption(art),
+                        "parse_mode": "Markdown",
+                    },
+                )
+            except Exception as exc2:
+                print(f"[WARN] Image ignorée ({art['title'][:40]}) : {exc2}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------
+# 5. RÉCUPÉRATION DES ARTICLES
 # ---------------------------------------------------------------------
 def get_recent_entries(feed_url, days_back=DAYS_BACK):
-    """
-    Retourne (articles_gardés, nombre_d_articles_récents_lus).
-    Lève une erreur si le flux est vide ou inaccessible.
-    """
+    """Retourne (articles_gardés, nombre_d_articles_récents_lus)."""
     feed = feedparser.parse(feed_url, agent=USER_AGENT)
 
     if not feed.entries:
@@ -148,7 +285,7 @@ def get_recent_entries(feed_url, days_back=DAYS_BACK):
 
         brand = find_brand(title, summary)
         if brand is None:
-            continue  # article hors de nos marques
+            continue
 
         recent.append(
             {
@@ -156,6 +293,8 @@ def get_recent_entries(feed_url, days_back=DAYS_BACK):
                 "link": entry.get("link", ""),
                 "date": published_dt,
                 "brand": brand,
+                "image": extract_image(entry),
+                "also": [],
             }
         )
 
@@ -164,8 +303,9 @@ def get_recent_entries(feed_url, days_back=DAYS_BACK):
 
 
 def collect_all_articles():
-    """Parcourt tous les flux configurés et renvoie {source: [articles]}."""
+    """Retourne ({source: [articles]}, [sources en échec])."""
     results = {}
+    failed = []
     for source_name, url in RSS_FEEDS:
         try:
             entries, in_window = get_recent_entries(url)
@@ -176,13 +316,58 @@ def collect_all_articles():
             if entries:
                 results[source_name] = entries
         except Exception as exc:
-            # un flux cassé ne doit pas faire planter tout le script
             print(f"[WARN] {source_name} ignoré : {exc}", file=sys.stderr)
-    return results
+            failed.append(f"{source_name} ({exc})")
+    return results, failed
 
 
 # ---------------------------------------------------------------------
-# 5. FORMATAGE ET DÉCOUPAGE DU MESSAGE
+# 6. DÉDOUBLONNAGE
+# ---------------------------------------------------------------------
+def title_tokens(title):
+    words = re.findall(r"[a-zà-ÿ0-9]+", title.lower())
+    return {w for w in words if len(w) >= 3 and w not in STOPWORDS}
+
+
+def is_duplicate(tokens_a, tokens_b):
+    """Deux titres sont jugés identiques s'ils partagent au moins 3 mots
+    importants et au moins 60% des mots du plus court."""
+    common = tokens_a & tokens_b
+    if len(common) < 3:
+        return False
+    return len(common) / min(len(tokens_a), len(tokens_b)) >= 0.6
+
+
+def deduplicate(articles_by_source):
+    """Garde la première occurrence, note les autres sources dans 'also'."""
+    kept = []
+    cleaned = {}
+
+    for source, articles in articles_by_source.items():
+        for art in articles:
+            tokens = title_tokens(art["title"])
+
+            original = None
+            for other in kept:
+                same_link = art["link"] and art["link"] == other["link"]
+                if same_link or is_duplicate(tokens, other["tokens"]):
+                    original = other
+                    break
+
+            if original:
+                original["also"].append(source)
+                print(f"[DEDUP] Doublon ignoré ({source}) : {art['title'][:60]}")
+                continue
+
+            art["tokens"] = tokens
+            kept.append(art)
+            cleaned.setdefault(source, []).append(art)
+
+    return cleaned
+
+
+# ---------------------------------------------------------------------
+# 7. FORMATAGE ET DÉCOUPAGE DU MESSAGE
 # ---------------------------------------------------------------------
 def format_message(articles_by_source):
     today = datetime.now().strftime("%d/%m/%Y")
@@ -204,6 +389,8 @@ def format_message(articles_by_source):
             details = [format_date(art["date"])]
             if art["brand"]:
                 details.append(art["brand"])
+            if art["also"]:
+                details.append("aussi : " + ", ".join(clean_title(s) for s in art["also"]))
 
             lines.append(f"• [{art['title']}]({art['link']})")
             lines.append(f"   _{' · '.join(details)}_")
@@ -225,7 +412,6 @@ def split_message(text, max_length=MAX_MESSAGE_LENGTH):
     current = ""
 
     for line in text.split("\n"):
-        # Cas rare : une seule ligne plus longue que la limite -> coupe brute
         while len(line) > max_length:
             if current:
                 chunks.append(current.rstrip())
@@ -246,35 +432,23 @@ def split_message(text, max_length=MAX_MESSAGE_LENGTH):
 
 
 # ---------------------------------------------------------------------
-# 6. ENVOI SUR TELEGRAM
+# 8. POINT D'ENTRÉE
 # ---------------------------------------------------------------------
-def send_to_telegram(text):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError(
-            "TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID manquant. "
-            "Vérifie tes variables d'environnement / secrets GitHub."
-        )
+def run():
+    if TEST_ALERT:
+        raise RuntimeError("Test d'alerte : tout va bien, c'est voulu !")
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": not SHOW_PREVIEW,
-    }
+    articles, failed = collect_all_articles()
 
-    response = requests.post(url, data=payload, timeout=15)
-    result = response.json()
+    if failed:
+        send_alert("⚠️ Cadran : flux en échec cette semaine :\n- " + "\n- ".join(failed))
 
-    if not result.get("ok"):
-        raise RuntimeError(f"Erreur Telegram : {result}")
+    if not articles and len(failed) == len(RSS_FEEDS):
+        raise RuntimeError("Tous les flux ont échoué, rien envoyé aux abonnés.")
 
+    if ENABLE_DEDUP:
+        articles = deduplicate(articles)
 
-# ---------------------------------------------------------------------
-# 7. POINT D'ENTRÉE
-# ---------------------------------------------------------------------
-def main():
-    articles = collect_all_articles()
     message = format_message(articles)
     print(message)
 
@@ -282,6 +456,17 @@ def main():
     for i, chunk in enumerate(chunks, start=1):
         send_to_telegram(chunk)
         print(f"Message {i}/{len(chunks)} envoyé.")
+
+    if ENABLE_IMAGES and articles:
+        send_images(articles)
+
+
+def main():
+    try:
+        run()
+    except Exception as exc:
+        send_alert(f"🚨 Cadran : le script a planté.\n{type(exc).__name__}: {exc}")
+        raise  # le run apparaît en rouge sur GitHub
 
 
 if __name__ == "__main__":
