@@ -49,7 +49,7 @@ MAX_ARTICLES_PER_FEED = 5
 
 # Telegram refuse les messages de plus de 4096 caractères.
 # On garde une petite marge de sécurité.
-MAX_MESSAGE_LENGTH = 300
+MAX_MESSAGE_LENGTH = 4000
 
 # True = Telegram affiche une grande carte d'aperçu pour le premier lien
 # False = message plus compact, sans aperçu
