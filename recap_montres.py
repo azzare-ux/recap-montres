@@ -25,7 +25,7 @@ import requests
 # 0. INTERRUPTEURS (True = activé, False = désactivé)
 # ---------------------------------------------------------------------
 ENABLE_DEDUP = True    # supprime les articles en double entre sources
-ENABLE_IMAGES = False  # envoie quelques photos après le récap
+ENABLE_IMAGES = True  # envoie quelques photos après le récap
 ENABLE_ALERTS = True   # t'écrit en privé si un flux ou le script plante
 TEST_ALERT = False     # True = fait planter le script exprès pour tester l'alerte
 
