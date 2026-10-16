@@ -20,18 +20,27 @@ import requests
 # ---------------------------------------------------------------------
 # 1. CONFIGURATION
 # ---------------------------------------------------------------------
+# Pour ajouter une source : une ligne ("Nom affiché", "adresse du flux").
+# Un flux qui ne marche pas est simplement ignoré (voir les logs [WARN]).
 RSS_FEEDS = [
     ("Monochrome Watches", "https://monochrome-watches.com/feed/"),
     ("Fratello Watches", "https://www.fratellowatches.com/feed/"),
     ("Hodinkee", "https://www.hodinkee.com/articles.rss"),
+    ("Montres Passion", "https://www.montres-passion.fr/feed/"),
+    ("A Blog To Watch", "https://www.ablogtowatch.com/feed/"),
+    ("Worn & Wound", "https://wornandwound.com/feed/"),
+    ("Time+Tide", "https://timeandtidewatches.com/feed/"),
 ]
 
-# Un emoji par source (change-les comme tu veux).
-# Si tu ajoutes une source dans RSS_FEEDS, ajoute-la ici aussi (sinon 📰 par défaut).
+# Un emoji par source. Même nom que dans RSS_FEEDS (sinon 📰 par défaut).
 SOURCE_EMOJIS = {
     "Monochrome Watches": "🔬",
     "Fratello Watches": "🏁",
     "Hodinkee": "📰",
+    "Montres Passion": "🇫🇷",
+    "A Blog To Watch": "🔎",
+    "Worn & Wound": "🛠️",
+    "Time+Tide": "🌊",
 }
 DEFAULT_EMOJI = "📰"
 
@@ -61,6 +70,9 @@ MAX_MESSAGE_LENGTH = 4000
 
 # True = grande carte d'aperçu pour le premier lien / False = message compact
 SHOW_PREVIEW = False
+
+# "Carte d'identité" envoyée aux sites (certains bloquent les robots sans).
+USER_AGENT = "Mozilla/5.0 (compatible; CadranBot/1.0)"
 
 SEPARATOR = "━━━━━━━━━━━━━━"
 WEEKDAYS_FR = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."]
@@ -107,10 +119,18 @@ def format_date(dt):
 # 4. RÉCUPÉRATION DES ARTICLES
 # ---------------------------------------------------------------------
 def get_recent_entries(feed_url, days_back=DAYS_BACK):
-    """Retourne les entrées récentes d'un flux RSS qui parlent de nos marques."""
-    feed = feedparser.parse(feed_url)
+    """
+    Retourne (articles_gardés, nombre_d_articles_récents_lus).
+    Lève une erreur si le flux est vide ou inaccessible.
+    """
+    feed = feedparser.parse(feed_url, agent=USER_AGENT)
+
+    if not feed.entries:
+        raise RuntimeError("flux vide ou inaccessible (vérifie l'adresse)")
+
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
     recent = []
+    in_window = 0
 
     for entry in feed.entries:
         published = entry.get("published_parsed") or entry.get("updated_parsed")
@@ -120,6 +140,8 @@ def get_recent_entries(feed_url, days_back=DAYS_BACK):
         published_dt = datetime(*published[:6], tzinfo=timezone.utc)
         if published_dt < cutoff:
             continue
+
+        in_window += 1
 
         title = entry.get("title", "Sans titre")
         summary = entry.get("summary", "")
@@ -138,7 +160,7 @@ def get_recent_entries(feed_url, days_back=DAYS_BACK):
         )
 
     recent.sort(key=lambda e: e["date"], reverse=True)
-    return recent[:MAX_ARTICLES_PER_FEED]
+    return recent[:MAX_ARTICLES_PER_FEED], in_window
 
 
 def collect_all_articles():
@@ -146,11 +168,16 @@ def collect_all_articles():
     results = {}
     for source_name, url in RSS_FEEDS:
         try:
-            entries = get_recent_entries(url)
+            entries, in_window = get_recent_entries(url)
+            print(
+                f"[OK] {source_name} : {in_window} article(s) récent(s), "
+                f"{len(entries)} gardé(s) après filtre"
+            )
             if entries:
                 results[source_name] = entries
         except Exception as exc:
-            print(f"[WARN] Flux '{source_name}' a échoué : {exc}", file=sys.stderr)
+            # un flux cassé ne doit pas faire planter tout le script
+            print(f"[WARN] {source_name} ignoré : {exc}", file=sys.stderr)
     return results
 
 
@@ -169,7 +196,7 @@ def format_message(articles_by_source):
     for source, articles in articles_by_source.items():
         emoji = SOURCE_EMOJIS.get(source, DEFAULT_EMOJI)
         lines.append(SEPARATOR)
-        lines.append(f"{emoji} *{source}*")
+        lines.append(f"{emoji} *{clean_title(source)}*")
         lines.append("")
 
         for art in articles:
