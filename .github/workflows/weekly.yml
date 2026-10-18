@@ -2,7 +2,7 @@ name: Recap Montres Hebdo
 
 on:
   schedule:
-    - cron: "17 8 * * 2"
+    - cron: "17 8 * * 1"
   workflow_dispatch:
 
 jobs:
