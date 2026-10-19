@@ -28,7 +28,7 @@ ENABLE_DEDUP = True         # supprime les articles en double entre sources
 ENABLE_TOP_PREVIEW = False   # grande image en haut du message (même message que le texte)
 ENABLE_IMAGES = True       # album de photos séparé, envoyé AVANT le texte
 ENABLE_ALERTS = True        # t'écrit en privé si un flux ou le script plante
-TEST_ALERT = False          # True = fait planter le script exprès pour tester l'alerte
+TEST_ALERT = True          # True = fait planter le script exprès pour tester l'alerte
 
 MAX_IMAGES = 3              # nombre de photos de l'album (si ENABLE_IMAGES)
 
