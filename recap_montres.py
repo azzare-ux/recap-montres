@@ -139,17 +139,28 @@ def send_to_telegram(text, preview_url=None):
 
 def send_alert(text):
     """Message privé d'alerte. Ne fait jamais planter le script."""
-    if not ENABLE_ALERTS or not ALERT_CHAT_ID or not TELEGRAM_TOKEN:
+    if not ENABLE_ALERTS:
+        print("[ALERTE] Désactivée (ENABLE_ALERTS = False).")
+        return
+    if not ALERT_CHAT_ID:
+        print("[ALERTE] ALERT_CHAT_ID est vide : secret absent ou non transmis par weekly.yml.")
+        return
+    if not TELEGRAM_TOKEN:
         return
     try:
         safe_text = text.replace(TELEGRAM_TOKEN, "***")[:4000]
-        requests.post(
+        response = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data={"chat_id": ALERT_CHAT_ID, "text": safe_text},
             timeout=15,
         )
+        result = response.json()
+        if result.get("ok"):
+            print("[ALERTE] Alerte privée envoyée.")
+        else:
+            print(f"[ALERTE] Telegram a refusé : {result.get('description')}")
     except Exception as exc:
-        print(f"[WARN] Alerte non envoyée : {str(exc).replace(TELEGRAM_TOKEN, '***')}", file=sys.stderr)
+        print(f"[ALERTE] Échec de l'envoi : {str(exc).replace(TELEGRAM_TOKEN, '***')}")
 
 
 # ---------------------------------------------------------------------
