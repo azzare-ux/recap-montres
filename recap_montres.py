@@ -3,8 +3,8 @@ Recap Montres Hebdo
 --------------------
 Lit une liste de flux RSS horlogerie, garde les articles des 7 derniers
 jours qui parlent de tes marques, supprime les doublons entre sources,
-envoie le récap sur Telegram (avec une grande image en haut) et t'alerte
-en privé si quelque chose plante.
+envoie le récap sur Telegram (avec un album de photos avant le texte et un
+lien vers ton site) et t'alerte en privé si quelque chose plante.
 
 Variables d'environnement attendues :
   TELEGRAM_TOKEN   -> le token donné par @BotFather
@@ -25,12 +25,16 @@ import requests
 # 0. INTERRUPTEURS (True = activé, False = désactivé)
 # ---------------------------------------------------------------------
 ENABLE_DEDUP = True         # supprime les articles en double entre sources
-ENABLE_TOP_PREVIEW = False   # grande image en haut du message (même message que le texte)
-ENABLE_IMAGES = True       # album de photos séparé, envoyé AVANT le texte
+ENABLE_TOP_PREVIEW = False  # grande image en haut du message (même message que le texte)
+ENABLE_IMAGES = True        # album de photos séparé, envoyé AVANT le texte
 ENABLE_ALERTS = True        # t'écrit en privé si un flux ou le script plante
 TEST_ALERT = False          # True = fait planter le script exprès pour tester l'alerte
 
 MAX_IMAGES = 3              # nombre de photos de l'album (si ENABLE_IMAGES)
+
+# Adresse de ton site, ajoutée en bas du récap.
+# Laisse "" (vide) pour ne pas afficher de lien.
+SITE_URL = "https://azzare-ux.github.io/cadran/"
 
 # ---------------------------------------------------------------------
 # 1. CONFIGURATION
@@ -392,12 +396,20 @@ def deduplicate(articles_by_source):
 # ---------------------------------------------------------------------
 # 7. FORMATAGE ET DÉCOUPAGE DU MESSAGE
 # ---------------------------------------------------------------------
+def site_footer():
+    """Lignes optionnelles avec le lien vers ton site (vide si SITE_URL est vide)."""
+    if not SITE_URL:
+        return []
+    return ["", f"📖 [Lire l'édition complète sur Cadran]({SITE_URL})"]
+
+
 def format_message(articles_by_source):
     today = datetime.now().strftime("%d/%m/%Y")
     lines = [f"⌚ *Récap Montres — semaine du {today}*", ""]
 
     if not articles_by_source:
         lines.append("Rien de notable cette semaine sur tes marques.")
+        lines.extend(site_footer())
         return "\n".join(lines)
 
     total = 0
@@ -422,6 +434,7 @@ def format_message(articles_by_source):
     lines.append(SEPARATOR)
     pluriel = "s" if total > 1 else ""
     lines.append(f"_{total} article{pluriel} cette semaine_")
+    lines.extend(site_footer())
 
     return "\n".join(lines).strip()
 
