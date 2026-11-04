@@ -2,9 +2,9 @@
 Recap Montres Hebdo
 --------------------
 Lit une liste de flux RSS horlogerie, garde les articles des 7 derniers
-jours qui parlent de tes marques, supprime les doublons entre sources,
-envoie le récap sur Telegram (avec un album de photos avant le texte et un
-lien vers ton site) et t'alerte en privé si quelque chose plante.
+jours qui parlent de tes marques ou mots-clés, supprime les doublons entre
+sources, envoie le récap sur Telegram (album de photos avant le texte et lien
+vers ton site) et t'alerte en privé si quelque chose plante.
 
 Variables d'environnement attendues :
   TELEGRAM_TOKEN   -> le token donné par @BotFather
@@ -12,10 +12,12 @@ Variables d'environnement attendues :
   ALERT_CHAT_ID    -> (optionnel) ton ID personnel, pour recevoir les alertes
 """
 
+import html
 import json
 import os
 import re
 import sys
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 import feedparser
@@ -29,11 +31,11 @@ ENABLE_TOP_PREVIEW = False  # grande image en haut du message (même message que
 ENABLE_IMAGES = True        # album de photos séparé, envoyé AVANT le texte
 ENABLE_ALERTS = True        # t'écrit en privé si un flux ou le script plante
 TEST_ALERT = False          # True = fait planter le script exprès pour tester l'alerte
+DEBUG_FILTER = True         # écrit dans les logs pourquoi chaque article est gardé ou écarté
 
 MAX_IMAGES = 3              # nombre de photos de l'album (si ENABLE_IMAGES)
 
-# Adresse de ton site, ajoutée en bas du récap.
-# Laisse "" (vide) pour ne pas afficher de lien.
+# Adresse de ton site, ajoutée en bas du récap ("" = pas de lien).
 SITE_URL = "https://azzare-ux.github.io/cadran/"
 
 # ---------------------------------------------------------------------
@@ -60,22 +62,65 @@ SOURCE_EMOJIS = {
 }
 DEFAULT_EMOJI = "📰"
 
-BRANDS = [
-    "Rolex",
-    "Omega",
-    "Patek Philippe",
-    "Audemars Piguet",
-    "Cartier",
-    "Tudor",
-    "Seiko",
-    "Grand Seiko",
-    "Jaeger-LeCoultre",
-    "Vacheron Constantin",
-    "IWC",
-    "Breitling",
-    "TAG Heuer",
-    "Panerai",
-]
+# MARQUES SUIVIES.
+# Format : "Nom affiché": ["variante 1", "variante 2"],   (liste vide = pas de variante)
+# Pas besoin de gérer les majuscules, les accents ni les tirets :
+# "Jaeger-LeCoultre" reconnaît aussi "Jaeger LeCoultre", "jaeger‑lecoultre", etc.
+# Pour ajouter une marque : une nouvelle ligne.  Pour en retirer : supprime sa ligne.
+BRANDS = {
+    # --- Les grandes maisons ---
+    "Rolex": [],
+    "Omega": [],
+    "Patek Philippe": ["patek"],
+    "Audemars Piguet": ["audemars"],
+    "Cartier": [],
+    "Tudor": [],
+    "Seiko": [],
+    "Grand Seiko": [],
+    "Jaeger-LeCoultre": ["lecoultre", "jlc"],
+    "Vacheron Constantin": ["vacheron"],
+    "IWC": [],
+    "Breitling": [],
+    "TAG Heuer": ["heuer"],
+    "Panerai": [],
+    # --- Autres maisons ---
+    "Hublot": [],
+    "Zenith": [],
+    "Longines": [],
+    "Tissot": [],
+    "Hamilton": [],
+    "Blancpain": [],
+    "Chopard": [],
+    "A. Lange & Söhne": ["lange sohne"],
+    "Richard Mille": [],
+    "F.P. Journe": ["journe"],
+    "Bell & Ross": [],
+    "Oris": [],
+    "Nomos": [],
+    "Montblanc": [],
+    "Hermès": [],
+    "Louis Vuitton": [],
+    "Tiffany & Co.": ["tiffany"],
+    "Bulgari": ["bvlgari"],
+    "Piaget": [],
+    "Ulysse Nardin": [],
+    "Girard-Perregaux": [],
+    "Minase": [],
+}
+
+# AUTRES MOTS-CLÉS (événements, sujets...). Même format que BRANDS.
+# Un article qui contient un de ces mots est gardé, même sans marque.
+KEYWORDS = {
+    "GPHG": [],
+    "Watches and Wonders": ["watches wonders"],
+    "Geneva Watch Days": [],
+    "Dubai Watch Week": [],
+    "LVMH Watch Week": [],
+}
+
+# L'article est cherché dans son titre, son résumé ET le début de son texte
+# (nombre de caractères du texte regardés ; 0 = titre et résumé seulement).
+SEARCH_BODY_CHARS = 600
 
 DAYS_BACK = 7
 MAX_ARTICLES_PER_FEED = 5
@@ -168,19 +213,54 @@ def send_alert(text):
 
 
 # ---------------------------------------------------------------------
-# 3. FILTRE PAR MARQUE ET NETTOYAGE
+# 3. MOTS-CLÉS (marques + autres)
 # ---------------------------------------------------------------------
-def find_brand(title, summary):
-    """Marque trouvée, None si aucune, "" si pas de filtre (BRANDS vide)."""
-    if not BRANDS:
+def normalize(text):
+    """Met un texte sous une forme comparable : sans balises HTML, sans accents,
+    en minuscules, tirets et ponctuation remplacés par des espaces."""
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = html.unescape(text)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return text.strip()
+
+
+def _compile_matchers(*groups):
+    """Prépare la recherche. Les motifs les plus longs passent en premier,
+    pour que 'Grand Seiko' soit reconnu avant 'Seiko'."""
+    compiled = []
+    for group in groups:
+        for name, variants in group.items():
+            for variant in [name] + list(variants):
+                norm = normalize(variant)
+                if norm:
+                    pattern = re.compile(r"(?<![a-z0-9])" + re.escape(norm) + r"(?![a-z0-9])")
+                    compiled.append((len(norm), name, pattern))
+    compiled.sort(key=lambda item: -item[0])
+    return [(name, pattern) for _, name, pattern in compiled]
+
+
+MATCHERS = _compile_matchers(BRANDS, KEYWORDS)
+
+
+def find_match(title, summary, body):
+    """Retourne le mot-clé trouvé (le titre est regardé en premier),
+    None si rien, ou "" si aucun filtre n'est défini."""
+    if not MATCHERS:
         return ""
-    text = f"{title} {summary}".lower()
-    for brand in BRANDS:
-        if brand.lower() in text:
-            return brand
+    for text in (title, f"{summary} {body}"):
+        norm = normalize(text)
+        for name, pattern in MATCHERS:
+            if pattern.search(norm):
+                return name
     return None
 
 
+# ---------------------------------------------------------------------
+# 4. NETTOYAGE ET IMAGES
+# ---------------------------------------------------------------------
 def clean_title(title):
     """Enlève les caractères qui peuvent casser le Markdown de Telegram."""
     title = title.replace("[", "(").replace("]", ")")
@@ -193,9 +273,6 @@ def format_date(dt):
     return f"{WEEKDAYS_FR[dt.weekday()]} {dt.strftime('%d/%m')}"
 
 
-# ---------------------------------------------------------------------
-# 4. IMAGES
-# ---------------------------------------------------------------------
 def extract_image(entry):
     """Cherche une image dans l'article RSS. Retourne une URL ou None."""
     for key in ("media_content", "media_thumbnail"):
@@ -208,12 +285,12 @@ def extract_image(entry):
         if enc.get("type", "").startswith("image") and enc.get("href", "").startswith("http"):
             return enc["href"]
 
-    html = ""
+    page = ""
     if entry.get("content"):
-        html = entry["content"][0].get("value", "")
-    html = html or entry.get("summary", "")
+        page = entry["content"][0].get("value", "")
+    page = page or entry.get("summary", "")
 
-    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html)
+    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', page)
     if match and match.group(1).startswith("http"):
         return match.group(1)
 
@@ -293,7 +370,7 @@ def get_recent_entries(feed_url, days_back=DAYS_BACK):
         raise RuntimeError("flux vide ou inaccessible (vérifie l'adresse)")
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
-    recent = []
+    kept = []
     in_window = 0
 
     for entry in feed.entries:
@@ -310,23 +387,31 @@ def get_recent_entries(feed_url, days_back=DAYS_BACK):
         title = entry.get("title", "Sans titre")
         summary = entry.get("summary", "")
 
-        brand = find_brand(title, summary)
-        if brand is None:
-            continue
+        body = ""
+        if SEARCH_BODY_CHARS and entry.get("content"):
+            body = normalize(entry["content"][0].get("value", ""))[:SEARCH_BODY_CHARS]
 
-        recent.append(
+        match = find_match(title, summary, body)
+        if match is None:
+            if DEBUG_FILTER:
+                print(f"   [FILTRE] écarté : {title[:80]}")
+            continue
+        if DEBUG_FILTER:
+            print(f"   [FILTRE] gardé ({match or 'sans filtre'}) : {title[:80]}")
+
+        kept.append(
             {
                 "title": clean_title(title),
                 "link": entry.get("link", ""),
                 "date": published_dt,
-                "brand": brand,
+                "match": match,
                 "image": extract_image(entry),
                 "also": [],
             }
         )
 
-    recent.sort(key=lambda e: e["date"], reverse=True)
-    return recent[:MAX_ARTICLES_PER_FEED], in_window
+    kept.sort(key=lambda e: e["date"], reverse=True)
+    return kept[:MAX_ARTICLES_PER_FEED], in_window
 
 
 def collect_all_articles():
@@ -335,6 +420,7 @@ def collect_all_articles():
     failed = []
     for source_name, url in RSS_FEEDS:
         try:
+            print(f"[LECTURE] {source_name}")
             entries, in_window = get_recent_entries(url)
             print(
                 f"[OK] {source_name} : {in_window} article(s) récent(s), "
@@ -422,8 +508,8 @@ def format_message(articles_by_source):
         for art in articles:
             total += 1
             details = [format_date(art["date"])]
-            if art["brand"]:
-                details.append(art["brand"])
+            if art["match"]:
+                details.append(art["match"])
             if art["also"]:
                 details.append("aussi : " + ", ".join(clean_title(s) for s in art["also"]))
 
