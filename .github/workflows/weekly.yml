@@ -2,8 +2,17 @@ name: Recap Montres Hebdo
 
 on:
   schedule:
+    # GARDE ICI TON JOUR ET TON HEURE si tu les avais changés (heure en UTC).
     - cron: "17 8 * * 1"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "Que veux-tu envoyer ?"
+        type: choice
+        default: tout
+        options:
+          - tout
+          - prive
 
 jobs:
   send-recap:
@@ -25,4 +34,5 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ALERT_CHAT_ID: ${{ secrets.ALERT_CHAT_ID }}
+          SEND_MODE: ${{ github.event.inputs.mode || 'tout' }}
         run: python recap_montres.py
